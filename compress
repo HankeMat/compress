@@ -1,0 +1,181 @@
+#!/bin/bash
+
+# Universal Media Compression Script (Video & Images)
+# Usage: compress <input_file> [-d] [-1-5] [-webp|-jpg|-png] [-mp4|-mkv|-mov]
+
+INPUT=""
+DELETE_ORIG=0
+CHOICE=""
+TARGET_FORMAT=""
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        -d) DELETE_ORIG=1 ;;
+        -1|-2|-3|-4|-5) CHOICE="${arg#-}" ;;
+        -webp|-jpg|-png|-mp4|-mkv|-mov) TARGET_FORMAT="${arg#-}" ;;
+        *) [ -z "$INPUT" ] && INPUT="$arg" ;;
+    esac
+done
+
+if [ -z "$INPUT" ] || [ ! -f "$INPUT" ]; then
+    echo "Usage: compress <input_file> [-d] [-1-5] [format_flag]"
+    echo "  -d             Delete original and replace"
+    echo "  -1..5          Compression strength (1=Lowest, 5=Highest)"
+    echo "  Image formats: -webp, -jpg, -png"
+    echo "  Video formats: -mp4, -mkv, -mov"
+    exit 1
+fi
+
+# Detect File Type
+MIME_TYPE=$(file --mime-type -b "$INPUT")
+CATEGORY=""
+if [[ "$MIME_TYPE" == video/* ]]; then
+    CATEGORY="VIDEO"
+elif [[ "$MIME_TYPE" == image/* ]]; then
+    CATEGORY="IMAGE"
+else
+    echo "Error: Unsupported file type ($MIME_TYPE)."
+    exit 1
+fi
+
+FILENAME=$(basename -- "$INPUT")
+DIR=$(dirname -- "$INPUT")
+BASENAME="${FILENAME%.*}"
+
+# Original size
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    ORIG_SIZE_BYTES=$(stat -f%z "$INPUT")
+else
+    ORIG_SIZE_BYTES=$(stat -c%s "$INPUT")
+fi
+ORIG_SIZE_MB=$(echo "scale=2; $ORIG_SIZE_BYTES / 1048576" | bc)
+
+# Video Duration for ETC
+DURATION_SEC=0
+if [ "$CATEGORY" == "VIDEO" ]; then
+    DURATION_SEC=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$INPUT" | cut -d. -f1)
+fi
+
+# Interactive Format Selection
+if [ -z "$TARGET_FORMAT" ]; then
+    clear
+    echo "=========================================="
+    echo "    SELECT OUTPUT FORMAT ($CATEGORY)"
+    echo "=========================================="
+    if [ "$CATEGORY" == "IMAGE" ]; then
+        echo "1) WebP (Best compression)"
+        echo "2) JPG  (High compatibility)"
+        echo "3) PNG  (Lossless)"
+        read -p "Choose format (1-3) [Default 1]: " FMT_CHOICE
+        case $FMT_CHOICE in
+            2) TARGET_FORMAT="jpg" ;;
+            3) TARGET_FORMAT="png" ;;
+            *) TARGET_FORMAT="webp" ;;
+        esac
+    else
+        echo "1) MP4  (Standard)"
+        echo "2) MKV  (Versatile)"
+        echo "3) MOV  (Apple)"
+        read -p "Choose format (1-3) [Default 1]: " FMT_CHOICE
+        case $FMT_CHOICE in
+            2) TARGET_FORMAT="mkv" ;;
+            3) TARGET_FORMAT="mov" ;;
+            *) TARGET_FORMAT="mp4" ;;
+        esac
+    fi
+fi
+
+OUTPUT="${DIR}/${BASENAME}_compressed.${TARGET_FORMAT}"
+
+# Presets & Speed Factors (Heuristics)
+if [ "$CATEGORY" == "VIDEO" ]; then
+    declare -a PRESETS=("Archive" "High Quality" "Balanced" "Aggressive" "Extreme")
+    declare -a CRFS=(16 20 24 28 32)
+    declare -a MULTIPLIERS=(0.95 0.85 0.70 0.50 0.30)
+    declare -a SPEEDS=(1.1 1.3 1.5 1.7 1.9) # Speed factors (x real-time)
+else
+    case $TARGET_FORMAT in
+        webp)
+            declare -a PRESETS=("Lossless-like" "High Quality" "Balanced" "Aggressive" "Extreme")
+            declare -a QUALITIES=(90 75 60 45 25)
+            declare -a MULTIPLIERS=(0.80 0.50 0.30 0.20 0.10)
+            ;;
+        jpg)
+            declare -a PRESETS=("Max Quality" "High Quality" "Balanced" "Aggressive" "Extreme")
+            declare -a QUALITIES=(2 5 10 20 40)
+            declare -a MULTIPLIERS=(0.90 0.70 0.50 0.30 0.15)
+            ;;
+        png)
+            declare -a PRESETS=("Fastest" "Quick" "Balanced" "Strong" "Max")
+            declare -a QUALITIES=(2 4 6 8 9)
+            declare -a MULTIPLIERS=(0.98 0.95 0.90 0.85 0.80)
+            ;;
+    esac
+fi
+
+# Selection Menu
+if [ -z "$CHOICE" ]; then
+    echo ""
+    echo "=========================================="
+    echo "    SELECT STRENGTH (Format: $TARGET_FORMAT)"
+    echo "=========================================="
+    echo "Input: $FILENAME ($ORIG_SIZE_MB MB)"
+    [ "$CATEGORY" == "VIDEO" ] && echo "Duration: $(($DURATION_SEC / 60))m $(($DURATION_SEC % 60))s"
+    echo "------------------------------------------"
+
+    for i in "${!PRESETS[@]}"; do
+        # Est Size
+        EST_SIZE=$(echo "scale=1; $ORIG_SIZE_MB * ${MULTIPLIERS[$i]}" | bc)
+        
+        # Est Time
+        if [ "$CATEGORY" == "VIDEO" ]; then
+            ETC_SEC=$(echo "$DURATION_SEC / ${SPEEDS[$i]}" | bc)
+            if [ $ETC_SEC -ge 60 ]; then
+                ETC_STR="$(($ETC_SEC / 60))m $(($ETC_SEC % 60))s"
+            else
+                ETC_STR="${ETC_SEC}s"
+            fi
+        else
+            ETC_STR="Instant"
+        fi
+        
+        printf "%d) %-15s -> Est. ~%s MB (Time: %s)\n" $((i+1)) "${PRESETS[$i]}" "$EST_SIZE" "$ETC_STR"
+    done
+    echo "------------------------------------------"
+    read -p "Choose strength (1-5): " CHOICE
+fi
+
+if [[ ! "$CHOICE" =~ ^[1-5]$ ]]; then
+    echo "Invalid choice. Exiting."
+    exit 1
+fi
+
+INDEX=$((CHOICE-1))
+echo ""
+echo ">> Processing: Level $CHOICE (Est. Time: $ETC_STR)"
+
+if [ "$CATEGORY" == "VIDEO" ]; then
+    ffmpeg -i "$INPUT" -vcodec libx265 -crf "${CRFS[$INDEX]}" -preset medium -acodec copy "$OUTPUT" -y
+else
+    case $TARGET_FORMAT in
+        webp) ffmpeg -i "$INPUT" -qscale:v "${QUALITIES[$INDEX]}" "$OUTPUT" -y ;;
+        jpg)  ffmpeg -i "$INPUT" -q:v "${QUALITIES[$INDEX]}" "$OUTPUT" -y ;;
+        png)  ffmpeg -i "$INPUT" -compression_level "${QUALITIES[$INDEX]}" "$OUTPUT" -y ;;
+    esac
+fi
+
+if [ $? -eq 0 ]; then
+    NEW_SIZE_BYTES=$(stat -c%s "$OUTPUT")
+    NEW_SIZE_MB=$(echo "scale=2; $NEW_SIZE_BYTES / 1048576" | bc)
+    REDUCTION_PERC=$(echo "scale=1; (1 - $NEW_SIZE_BYTES / $ORIG_SIZE_BYTES) * 100" | bc)
+    
+    echo "------------------------------------------"
+    echo "SUCCESS!"
+    echo "New size: $NEW_SIZE_MB MB (Saved: $REDUCTION_PERC%)"
+    [ $DELETE_ORIG -eq 1 ] && { rm "$INPUT"; echo ">> Original replaced."; }
+    echo "------------------------------------------"
+else
+    echo "Error: Failed."; [ -f "$OUTPUT" ] && rm "$OUTPUT"
+    exit 1
+fi
