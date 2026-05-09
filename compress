@@ -1,29 +1,33 @@
 #!/bin/bash
 
 # Universal Media Compression Script (Video & Images)
-# Usage: compress <input_file> [-d] [-1-5] [-webp|-jpg|-png] [-mp4|-mkv|-mov]
+# Usage: compress <input_file> [-d] [-1-5] [-webp|-jpg|-png] [-mp4|-mkv|-mov|-avi] [-h264|-h265]
 
 INPUT=""
 DELETE_ORIG=0
 CHOICE=""
 TARGET_FORMAT=""
+CODEC="libx265" # Default
 
 # Parse arguments
 for arg in "$@"; do
     case $arg in
         -d) DELETE_ORIG=1 ;;
         -1|-2|-3|-4|-5) CHOICE="${arg#-}" ;;
-        -webp|-jpg|-png|-mp4|-mkv|-mov) TARGET_FORMAT="${arg#-}" ;;
+        -webp|-jpg|-png|-mp4|-mkv|-mov|-avi) TARGET_FORMAT="${arg#-}" ;;
+        -h264) CODEC="libx264" ;;
+        -h265) CODEC="libx265" ;;
         *) [ -z "$INPUT" ] && INPUT="$arg" ;;
     esac
 done
 
 if [ -z "$INPUT" ] || [ ! -f "$INPUT" ]; then
-    echo "Usage: compress <input_file> [-d] [-1-5] [format_flag]"
+    echo "Usage: compress <input_file> [-d] [-1-5] [format_flag] [-h264|-h265]"
     echo "  -d             Delete original and replace"
     echo "  -1..5          Compression strength (1=Lowest, 5=Highest)"
     echo "  Image formats: -webp, -jpg, -png"
-    echo "  Video formats: -mp4, -mkv, -mov"
+    echo "  Video formats: -mp4, -mkv, -mov, -avi"
+    echo "  Video codecs:  -h264, -h265 (Default)"
     exit 1
 fi
 
@@ -37,6 +41,11 @@ elif [[ "$MIME_TYPE" == image/* ]]; then
 else
     echo "Error: Unsupported file type ($MIME_TYPE)."
     exit 1
+fi
+
+# If AVI is selected, force H.264 for compatibility
+if [ "$TARGET_FORMAT" == "avi" ]; then
+    CODEC="libx264"
 fi
 
 FILENAME=$(basename -- "$INPUT")
@@ -74,13 +83,15 @@ if [ -z "$TARGET_FORMAT" ]; then
             *) TARGET_FORMAT="webp" ;;
         esac
     else
-        echo "1) MP4  (Standard)"
-        echo "2) MKV  (Versatile)"
-        echo "3) MOV  (Apple)"
-        read -p "Choose format (1-3) [Default 1]: " FMT_CHOICE
+        echo "1) MP4  (Standard, supports H.264/H.265)"
+        echo "2) MKV  (Versatile, supports H.264/H.265)"
+        echo "3) AVI  (Legacy, forces H.264)"
+        echo "4) MOV  (Apple standard)"
+        read -p "Choose format (1-4) [Default 1]: " FMT_CHOICE
         case $FMT_CHOICE in
             2) TARGET_FORMAT="mkv" ;;
-            3) TARGET_FORMAT="mov" ;;
+            3) TARGET_FORMAT="avi"; CODEC="libx264" ;;
+            4) TARGET_FORMAT="mov" ;;
             *) TARGET_FORMAT="mp4" ;;
         esac
     fi
@@ -88,12 +99,19 @@ fi
 
 OUTPUT="${DIR}/${BASENAME}_compressed.${TARGET_FORMAT}"
 
-# Presets & Speed Factors (Heuristics)
+# Presets & Speed Factors
 if [ "$CATEGORY" == "VIDEO" ]; then
     declare -a PRESETS=("Archive" "High Quality" "Balanced" "Aggressive" "Extreme")
-    declare -a CRFS=(16 20 24 28 32)
-    declare -a MULTIPLIERS=(0.95 0.85 0.70 0.50 0.30)
-    declare -a SPEEDS=(1.1 1.3 1.5 1.7 1.9) # Speed factors (x real-time)
+    if [ "$CODEC" == "libx265" ]; then
+        declare -a CRFS=(16 20 24 28 32)
+        declare -a MULTIPLIERS=(0.95 0.85 0.70 0.50 0.30)
+        declare -a SPEEDS=(1.1 1.3 1.5 1.7 1.9)
+    else
+        # H.264 is faster but produces larger files
+        declare -a CRFS=(18 20 23 26 30)
+        declare -a MULTIPLIERS=(0.98 0.90 0.80 0.65 0.50) # H.264 doesn't compress as much as H.265
+        declare -a SPEEDS=(2.5 3.0 3.5 4.0 4.5) # H.264 is much faster
+    fi
 else
     case $TARGET_FORMAT in
         webp)
@@ -118,19 +136,17 @@ fi
 if [ -z "$CHOICE" ]; then
     echo ""
     echo "=========================================="
-    echo "    SELECT STRENGTH (Format: $TARGET_FORMAT)"
+    echo "    SELECT STRENGTH ($TARGET_FORMAT | $CODEC)"
     echo "=========================================="
     echo "Input: $FILENAME ($ORIG_SIZE_MB MB)"
     [ "$CATEGORY" == "VIDEO" ] && echo "Duration: $(($DURATION_SEC / 60))m $(($DURATION_SEC % 60))s"
     echo "------------------------------------------"
 
     for i in "${!PRESETS[@]}"; do
-        # Est Size
         EST_SIZE=$(echo "scale=1; $ORIG_SIZE_MB * ${MULTIPLIERS[$i]}" | bc)
-        
-        # Est Time
         if [ "$CATEGORY" == "VIDEO" ]; then
             ETC_SEC=$(echo "$DURATION_SEC / ${SPEEDS[$i]}" | bc)
+            [ $ETC_SEC -lt 1 ] && ETC_SEC=1
             if [ $ETC_SEC -ge 60 ]; then
                 ETC_STR="$(($ETC_SEC / 60))m $(($ETC_SEC % 60))s"
             else
@@ -139,7 +155,6 @@ if [ -z "$CHOICE" ]; then
         else
             ETC_STR="Instant"
         fi
-        
         printf "%d) %-15s -> Est. ~%s MB (Time: %s)\n" $((i+1)) "${PRESETS[$i]}" "$EST_SIZE" "$ETC_STR"
     done
     echo "------------------------------------------"
@@ -153,10 +168,10 @@ fi
 
 INDEX=$((CHOICE-1))
 echo ""
-echo ">> Processing: Level $CHOICE (Est. Time: $ETC_STR)"
+echo ">> Processing: Level $CHOICE (Codec: $CODEC, Est. Time: $ETC_STR)"
 
 if [ "$CATEGORY" == "VIDEO" ]; then
-    ffmpeg -i "$INPUT" -vcodec libx265 -crf "${CRFS[$INDEX]}" -preset medium -acodec copy "$OUTPUT" -y
+    ffmpeg -i "$INPUT" -vcodec "$CODEC" -crf "${CRFS[$INDEX]}" -preset medium -acodec copy "$OUTPUT" -y
 else
     case $TARGET_FORMAT in
         webp) ffmpeg -i "$INPUT" -qscale:v "${QUALITIES[$INDEX]}" "$OUTPUT" -y ;;
